@@ -1,0 +1,69 @@
+name: family-event-bot
+
+services:
+  bot:
+    build: .
+    image: family-event-bot:latest
+    container_name: family-event-bot
+    env_file: .env
+    environment:
+      DATA_DIR: /data
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.healthcheck"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+    mem_limit: 256m
+    logging: &logging
+      driver: json-file
+      options: { max-size: "5m", max-file: "3" }
+
+  # Separate process that alerts on Telegram if the bot stops responding.
+  watchdog:
+    image: family-event-bot:latest
+    container_name: family-event-bot-watchdog
+    pull_policy: never
+    depends_on: [bot]
+    command: ["python", "-m", "app.watchdog"]
+    env_file: .env
+    environment:
+      DATA_DIR: /data
+    volumes:
+      - ./data:/data:ro
+    restart: unless-stopped
+    mem_limit: 64m
+    logging: *logging
+
+  # Local speech-to-text for voice notes (NVIDIA Parakeet, ONNX on CPU). No host port:
+  # only the bot can reach it, and audio never leaves the Mac.
+  stt:
+    build: ./stt
+    image: family-event-bot-stt:latest
+    container_name: family-event-bot-stt
+    environment:
+      VOICE_MAX_SECONDS: ${VOICE_MAX_SECONDS:-120}
+    restart: unless-stopped
+    mem_limit: 3g
+    logging: *logging
+
+  # Temporary local CalDAV calendar. Enabled with COMPOSE_PROFILES=radicale in .env.
+  radicale:
+    profiles: ["radicale"]
+    image: tomsquest/docker-radicale:3.2.3.0
+    container_name: family-radicale
+    ports:
+      - "127.0.0.1:5232:5232"
+    volumes:
+      - ./radicale/config:/config/config:ro
+      - ./radicale/users:/config/users:ro
+      - radicale-data:/data
+    restart: unless-stopped
+    mem_limit: 128m
+    logging: *logging
+
+volumes:
+  radicale-data:

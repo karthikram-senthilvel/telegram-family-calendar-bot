@@ -1,0 +1,8 @@
+.env
+data
+.venv
+radicale
+tests
+scripts
+**/__pycache__
+client_secret*.json
