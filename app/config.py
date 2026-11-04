@@ -80,6 +80,8 @@ class Config:
     stt_url: str | None = None
     voice_max_seconds: int = 120
     local_places: str = ""
+    image_sources: str = ""
+    child_class: str = ""
     notify_on_start: bool = True
     # Google
     google_token_path: Path | None = None
@@ -123,6 +125,8 @@ class Config:
             local_places=os.environ.get(
                 "LOCAL_PLACES", "Plano, Frisco, McKinney, Allen, Prosper, Richardson, Dallas"
             ).strip(),
+            image_sources=os.environ.get("IMAGE_SOURCES", "").strip(),
+            child_class=os.environ.get("CHILD_CLASS", "").strip(),
         )
         if backend == "google":
             cfg.google_token_path = Path(

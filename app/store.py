@@ -1,4 +1,8 @@
-"""Small SQLite store for per-chat conversation state and undo actions."""
+"""Small SQLite store for per-chat conversation state, undo actions and usage counts.
+
+No message text, audio or images are stored: only short-lived working state, which
+cleanup() removes once it expires.
+"""
 from __future__ import annotations
 
 import json
@@ -10,11 +14,14 @@ from pathlib import Path
 
 PENDING_TTL_SECONDS = 30 * 60
 UNDO_TTL_SECONDS = 7 * 24 * 3600
+PROPOSAL_TTL_SECONDS = 24 * 3600
+USAGE_KEEP_SECONDS = 400 * 24 * 3600  # a little over a year, enough for /usage
 
 
 class Store:
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
+        self.path = path
         self._db = sqlite3.connect(str(path), check_same_thread=False)
         self._lock = threading.Lock()
         with self._lock, self._db:
@@ -38,6 +45,12 @@ class Store:
                     action TEXT NOT NULL,
                     created REAL NOT NULL,
                     used INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS proposal (
+                    chat_id INTEGER PRIMARY KEY,
+                    token TEXT NOT NULL,
+                    data TEXT NOT NULL,
+                    created REAL NOT NULL
                 );
                 """
             )
@@ -110,6 +123,67 @@ class Store:
                 return None
             self._db.execute("UPDATE undo SET used=1 WHERE token=?", (token,))
         return row[0], json.loads(row[1])
+
+    # -- picture proposal awaiting confirmation -------------------------------
+    def set_proposal(self, chat_id: int, data: dict, token: str | None = None) -> str:
+        token = token or secrets.token_urlsafe(9)
+        with self._lock, self._db:
+            self._db.execute(
+                "INSERT INTO proposal(chat_id, token, data, created) VALUES(?,?,?,?) "
+                "ON CONFLICT(chat_id) DO UPDATE SET token=excluded.token, data=excluded.data, "
+                "created=excluded.created",
+                (chat_id, token, json.dumps(data), time.time()),
+            )
+        return token
+
+    def get_proposal(self, chat_id: int) -> tuple[str, dict] | None:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT token, data, created FROM proposal WHERE chat_id=?", (chat_id,)
+            ).fetchone()
+        if not row:
+            return None
+        if time.time() - row[2] > PROPOSAL_TTL_SECONDS:
+            self.clear_proposal(chat_id)
+            return None
+        return row[0], json.loads(row[1])
+
+    def clear_proposal(self, chat_id: int) -> bool:
+        with self._lock, self._db:
+            return self._db.execute("DELETE FROM proposal WHERE chat_id=?", (chat_id,)).rowcount > 0
+
+    # -- housekeeping ---------------------------------------------------------
+    def cleanup(self) -> dict[str, int]:
+        """Delete expired state and old usage rows, then compact the file."""
+        now = time.time()
+        with self._lock, self._db:
+            removed = {
+                "undo": self._db.execute(
+                    "DELETE FROM undo WHERE used=1 OR created < ?", (now - UNDO_TTL_SECONDS,)
+                ).rowcount,
+                "pending": self._db.execute(
+                    "UPDATE chat_state SET pending=NULL, pending_at=NULL "
+                    "WHERE pending IS NOT NULL AND pending_at < ?", (now - PENDING_TTL_SECONDS,)
+                ).rowcount,
+                "proposal": self._db.execute(
+                    "DELETE FROM proposal WHERE created < ?", (now - PROPOSAL_TTL_SECONDS,)
+                ).rowcount,
+                "llm_usage": self._db.execute(
+                    "DELETE FROM llm_usage WHERE ts < ?", (now - USAGE_KEEP_SECONDS,)
+                ).rowcount,
+            }
+        with self._lock:
+            self._db.execute("VACUUM")
+        return removed
+
+    def stats(self) -> dict[str, int]:
+        with self._lock:
+            counts = {
+                t: self._db.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+                for t in ("chat_state", "undo", "proposal", "llm_usage")
+            }
+        counts["bytes"] = self.path.stat().st_size
+        return counts
 
     # -- LLM usage ------------------------------------------------------------
     def add_usage(self, model: str, input_tokens: int, output_tokens: int) -> None:

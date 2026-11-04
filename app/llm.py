@@ -1,6 +1,7 @@
-"""OpenRouter client and the message-interpretation prompt."""
+"""LLM clients (Gemini, OpenRouter) and the message-interpretation prompt."""
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import re
@@ -78,8 +79,14 @@ def estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float | 
     return (input_tokens * price[0] + output_tokens * price[1]) / 1_000_000
 
 
+Attachment = tuple[bytes, str]  # (file bytes, MIME type), e.g. a photo or PDF
+
+
 class LLM(Protocol):
     async def interpret(self, context: str, message: str) -> dict: ...
+
+    async def complete(self, system: str, text: str, attachment: Attachment | None = None,
+                       max_tokens: int = 4096) -> dict: ...
 
 
 class LLMError(RuntimeError):
@@ -103,7 +110,7 @@ def extract_json(text: str) -> dict:
 
 
 class OpenRouterLLM:
-    def __init__(self, api_key: str, models: list[str], zdr: bool = True, timeout: float = 45.0):
+    def __init__(self, api_key: str, models: list[str], zdr: bool = True, timeout: float = 90.0):
         self.models = models
         self.zdr = zdr
         self.on_usage: UsageCallback | None = None
@@ -117,17 +124,27 @@ class OpenRouterLLM:
         )
 
     def _payload(self, context: str, message: str) -> dict:
+        return self._body(SYSTEM_PROMPT, f"{context}\n\nMESSAGE:\n{message}", None, 800)
+
+    def _body(self, system: str, text: str, attachment: Attachment | None, max_tokens: int) -> dict:
         provider: dict = {"data_collection": "deny", "allow_fallbacks": True}
         if self.zdr:
             provider["zdr"] = True
+        content: str | list = text
+        if attachment:
+            data, mime = attachment
+            uri = f"data:{mime};base64,{base64.b64encode(data).decode()}"
+            part = ({"type": "file", "file": {"filename": "upload.pdf", "file_data": uri}}
+                    if mime == "application/pdf" else {"type": "image_url", "image_url": {"url": uri}})
+            content = [{"type": "text", "text": text}, part]
         payload = {
             "model": self.models[0],
             "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": f"{context}\n\nMESSAGE:\n{message}"},
+                {"role": "system", "content": system},
+                {"role": "user", "content": content},
             ],
             "temperature": 0,
-            "max_tokens": 800,
+            "max_tokens": max_tokens,
             "response_format": {"type": "json_object"},
             "provider": provider,
         }
@@ -136,7 +153,13 @@ class OpenRouterLLM:
         return payload
 
     async def interpret(self, context: str, message: str) -> dict:
-        payload = self._payload(context, message)
+        return await self._send(self._payload(context, message))
+
+    async def complete(self, system: str, text: str, attachment: Attachment | None = None,
+                       max_tokens: int = 4096) -> dict:
+        return await self._send(self._body(system, text, attachment, max_tokens))
+
+    async def _send(self, payload: dict) -> dict:
         last_err: Exception | None = None
         for attempt in range(2):
             try:
@@ -193,25 +216,38 @@ class GeminiLLM:
     out of training; the free tier does not.
     """
 
-    def __init__(self, api_key: str, models: list[str], timeout: float = 45.0):
+    def __init__(self, api_key: str, models: list[str], timeout: float = 90.0):
         self.models = models
         self.on_usage: UsageCallback | None = None
         self._client = httpx.AsyncClient(timeout=timeout, headers={"x-goog-api-key": api_key})
 
     def _payload(self, context: str, message: str) -> dict:
+        return self._body(SYSTEM_PROMPT, f"{context}\n\nMESSAGE:\n{message}", None, 4096)
+
+    def _body(self, system: str, text: str, attachment: Attachment | None, max_tokens: int) -> dict:
+        parts: list[dict] = [{"text": text}]
+        if attachment:
+            data, mime = attachment
+            parts.append({"inlineData": {"mimeType": mime, "data": base64.b64encode(data).decode()}})
         return {
-            "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
-            "contents": [{"role": "user", "parts": [{"text": f"{context}\n\nMESSAGE:\n{message}"}]}],
+            "systemInstruction": {"parts": [{"text": system}]},
+            "contents": [{"role": "user", "parts": parts}],
             "generationConfig": {
                 "temperature": 0,
                 "responseMimeType": "application/json",
                 # Generous: on thinking models, reasoning tokens count against this limit.
-                "maxOutputTokens": 4096,
+                "maxOutputTokens": max_tokens,
             },
         }
 
     async def interpret(self, context: str, message: str) -> dict:
-        payload = self._payload(context, message)
+        return await self._send(self._payload(context, message))
+
+    async def complete(self, system: str, text: str, attachment: Attachment | None = None,
+                       max_tokens: int = 4096) -> dict:
+        return await self._send(self._body(system, text, attachment, max_tokens))
+
+    async def _send(self, payload: dict) -> dict:
         last_err: Exception | None = None
         for model in self.models:
             for attempt in range(2):

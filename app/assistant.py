@@ -14,13 +14,25 @@ from zoneinfo import ZoneInfo
 from .calendars.base import CalendarBackend
 from .dates import (
     TIME_DEFAULTS,
+    WEEKDAYS,
     date_reference,
     fmt_date,
     fmt_short,
+    fmt_time,
     fmt_when,
     parse_date,
     parse_hhmm,
     resolve_times,
+)
+from .images import (
+    IMAGE_MIME_TYPES,
+    IMAGE_PROMPT,
+    MAX_IMAGE_BYTES,
+    REVISE_PROMPT,
+    number_rows,
+    prefix_for,
+    review_items,
+    with_prefix,
 )
 from .llm import LLM, LLMBillingError, LLMError, estimate_cost
 from .models import Event
@@ -46,16 +58,26 @@ HELP_TEXT = (
     "/usage – which AI model answered and what it cost\n"
     "/cancel – drop whatever I was asking and start over\n"
     "/help – this message\n\n"
-    "🎙 You can also send a voice note instead of typing.\n\n"
+    "🎙 You can also send a voice note instead of typing.\n"
+    "📷 Send a photo or PDF of a school calendar or flyer: I'll list the events and ask before adding them.\n\n"
     "Times: morning 9:00, noon 12:00, afternoon 14:00, evening 18:00, night 20:00. "
     "No time means all-day."
 )
+
+
+CREDITS_MSG = (
+    "⚠️ The language model account is out of credits, so I can't read messages right now. "
+    "Top up the Gemini API credits in AI Studio (ai.studio → Billing) and try again."
+)
+LLM_DOWN_MSG = "⚠️ I couldn't reach the language model just now. Please try again in a minute."
+EXPIRED_MSG = "That list has expired or was already handled — send the picture again if needed."
 
 
 @dataclass
 class Reply:
     text: str  # Telegram HTML
     undo_token: str | None = None
+    buttons: list[tuple[str, str]] | None = None  # (label, callback data)
 
 
 def _clean(value) -> str | None:
@@ -77,6 +99,8 @@ class Assistant:
         stt: STT | None = None,
         voice_max_seconds: int = 120,
         local_places: str = "",
+        image_sources: list[tuple[str, str]] | None = None,
+        child_class: str = "",
     ):
         self.llm = llm
         self.cal = calendar
@@ -88,6 +112,8 @@ class Assistant:
         self.stt = stt
         self.voice_max_seconds = voice_max_seconds
         self.local_places = local_places
+        self.image_sources = image_sources or []
+        self.child_class = child_class
 
     def now(self) -> datetime:
         return self._now().astimezone(self.tz)
@@ -96,9 +122,11 @@ class Assistant:
         return await asyncio.to_thread(fn, *args)
 
     # ------------------------------------------------------------------ entry
+    def _lock(self, chat_id: int) -> asyncio.Lock:
+        return self._locks.setdefault(chat_id, asyncio.Lock())
+
     async def handle(self, chat_id: int, text: str, voice: bool = False) -> list[Reply]:
-        lock = self._locks.setdefault(chat_id, asyncio.Lock())
-        async with lock:
+        async with self._lock(chat_id):
             return await self._handle(chat_id, text.strip(), voice)
 
     async def handle_voice(self, chat_id: int, audio: bytes, seconds: int) -> list[Reply]:
@@ -128,6 +156,12 @@ class Assistant:
         if CANCEL_RE.match(text):
             return [self.cancel(chat_id)]
 
+        proposal = self.store.get_proposal(chat_id)
+        if proposal:
+            replies = await self._revise(chat_id, text, *proposal)
+            if replies is not None:
+                return replies
+
         pending = self.store.get_pending(chat_id)
         known = await self._known_events(chat_id)
         context = self._build_context(chat_id, pending, known)
@@ -141,16 +175,14 @@ class Assistant:
         try:
             result = await self.llm.interpret(context, text)
         except LLMBillingError:
-            return [Reply(
-                "⚠️ The language model account is out of credits, so I can't read messages right now. "
-                "Top up the Gemini API credits in AI Studio (ai.studio → Billing) and try again."
-            )]
+            return [Reply(CREDITS_MSG)]
         except LLMError as e:
             log.error("LLM failure: %s", e)
-            return [Reply("⚠️ I couldn't reach the language model just now. Please try again in a minute.")]
-        log.info("interpretation: %s", json.dumps(result)[:1000])
+            return [Reply(LLM_DOWN_MSG)]
 
         intent = str(result.get("intent") or "chat").lower()
+        # Never log what was said: only its shape.
+        log.info("interpretation: intent=%s events=%d", intent, len(result.get("events") or []))
         continues = bool(result.get("continues_pending")) and pending is not None and intent == "create"
         if pending is not None:
             # Either answered now or replaced by a fresh request; _create re-arms it only
@@ -178,6 +210,9 @@ class Assistant:
         )]
 
     def cancel(self, chat_id: int) -> Reply:
+        if self.store.clear_proposal(chat_id):
+            self.store.clear_pending(chat_id)
+            return Reply("Okay, nothing added from that picture. Starting fresh.")
         if self.store.clear_pending(chat_id):
             return Reply("Okay, cancelled that. Starting fresh — send me a new event any time.")
         return Reply("Nothing was pending — we're starting fresh. Send me a new event any time.")
@@ -272,7 +307,7 @@ class Assistant:
         names = [(_clean(d.get("title")) or "the untitled one") for d in drafts]
         return "I need a bit more for " + ", ".join(names) + ": what are the titles and dates?"
 
-    async def _create_one(self, chat_id: int, d: dict) -> Reply:
+    def _event_from_draft(self, d: dict) -> tuple[Event, list[str]]:
         day = parse_date(d["date"])
         start, end, notes = resolve_times(
             day, parse_date(d.get("end_date")), d.get("start_time"), d.get("end_time"),
@@ -284,6 +319,11 @@ class Assistant:
             location=_clean(d.get("location")),
             notes=_clean(d.get("notes")),
         )
+        return ev, notes
+
+    async def _create_one(self, chat_id: int, d: dict) -> Reply:
+        ev, notes = self._event_from_draft(d)
+        day = ev.start_date()
         if day < self.now().date():
             notes.append("heads up: that date is in the past")
         try:
@@ -363,6 +403,13 @@ class Assistant:
         _, action = taken
         op = action["op"]
         try:
+            if op == "delete_many":
+                for event_id in action["event_ids"]:
+                    await self._cal(self.cal.delete, event_id)
+                if self.store.get_last_event(chat_id) in action["event_ids"]:
+                    self.store.set_last_event(chat_id, None)
+                n = len(action["event_ids"])
+                return f"↩️ Undone — removed the {n} event{'s' if n != 1 else ''} from the picture."
             if op == "delete":
                 await self._cal(self.cal.delete, action["event_id"])
                 if self.store.get_last_event(chat_id) == action["event_id"]:
@@ -381,6 +428,192 @@ class Assistant:
             log.exception("undo failed")
             return "⚠️ Undo failed. Please check the calendar."
         return "That can't be undone."
+
+    # -------------------------------------------------------------- pictures
+    async def handle_image(self, chat_id: int, data: bytes, mime: str, caption: str = "") -> list[Reply]:
+        """Read events from a picture or PDF and propose them; nothing is added until confirmed."""
+        if mime not in IMAGE_MIME_TYPES:
+            return [Reply("I can read photos (JPG, PNG, HEIC) and PDFs. Please send it as one of those.")]
+        if len(data) > MAX_IMAGE_BYTES:
+            return [Reply("That file is too big for me (over 15 MB). Try a screenshot of the calendar instead.")]
+        async with self._lock(chat_id):
+            parts = ["DATE REFERENCE:", date_reference(self.now())]
+            if self.child_class:
+                parts.append(f"\nOUR CLASS: {self.child_class}")
+            if caption.strip():
+                parts.append(f"\nSENDER'S NOTE: {caption.strip()}")
+            try:
+                result = await self.llm.complete(IMAGE_PROMPT, "\n".join(parts), (data, mime), max_tokens=8192)
+            except LLMBillingError:
+                return [Reply(CREDITS_MSG)]
+            except LLMError as e:
+                log.error("LLM failure on picture: %s", e)
+                return [Reply(LLM_DOWN_MSG)]
+            items = [i for i in (result.get("items") or []) if isinstance(i, dict)]
+            if not items:
+                why = _clean(result.get("reply"))
+                return [Reply(escape(why) if why else "I couldn't find any dated events in that picture.")]
+
+            source = _clean(result.get("source"))
+            prefix = prefix_for(source, self.image_sources)
+            rows = review_items(items, self.now().date(), prefix, await self._existing(items))
+            proposal = {"source": source, "period": _clean(result.get("period")), "prefix": prefix, "rows": rows}
+            token = self.store.set_proposal(chat_id, proposal)
+            log.info("picture: %d items read, %d proposed", len(rows), sum(r["include"] for r in rows))
+            return [self._proposal_reply(token, proposal)]
+
+    async def _existing(self, items: list[dict]) -> set[tuple[str, date]]:
+        """(lower-case title, start date) of events already on the calendar around these dates."""
+        days = [d for d in (parse_date(i.get("date")) for i in items) if d]
+        if not days:
+            return set()
+        start = datetime.combine(min(days), datetime.min.time(), tzinfo=self.tz)
+        end = datetime.combine(max(days) + timedelta(days=2), datetime.min.time(), tzinfo=self.tz)
+        try:
+            events = await self._cal(self.cal.list_between, start, end, 250)
+        except Exception:
+            log.exception("could not list events")
+            return set()
+        return {(e.title.lower(), e.start_date()) for e in events}
+
+    def _row_line(self, r: dict) -> str:
+        day = parse_date(r["date"])
+        when = f"{WEEKDAYS[day.weekday()][:3]} {day.strftime('%b')} {day.day}"
+        end_day = parse_date(r.get("end_date"))
+        if end_day:
+            when += f" – {WEEKDAYS[end_day.weekday()][:3]} {end_day.strftime('%b')} {end_day.day}"
+        st, et = parse_hhmm(r.get("start_time")), parse_hhmm(r.get("end_time"))
+        if st:
+            when += ", " + fmt_time(st) + (f"–{fmt_time(et)}" if et else "")
+        line = f"{r['n']}. {escape(when)} · <b>{escape(r['title'])}</b>"
+        if r.get("location"):
+            line += f" · {escape(r['location'])}"
+        return line
+
+    def _proposal_reply(self, token: str, proposal: dict) -> Reply:
+        rows = proposal["rows"]
+        add = [r for r in rows if r["include"]]
+        skip = [r for r in rows if not r["include"]]
+        head = escape(proposal.get("source") or "The picture")
+        period = parse_date((proposal.get("period") or "") + "-01")
+        if period:
+            head += f" — {period.strftime('%B %Y')}"
+        lines = [f"📷 <b>{head}</b>"]
+        if add:
+            lines.append("\nI'll add these:")
+            for r in add:
+                lines.append(self._row_line(r))
+                if r.get("notes"):
+                    lines.append(f"    📝 {escape(r['notes'])}")
+                if r.get("warning"):
+                    lines.append(f"    ⚠️ <i>{escape(r['warning'])}</i>")
+        else:
+            lines.append("\nNothing new to add from this one.")
+        if skip:
+            # Grouped by reason to keep it short; numbers still work for "add 12 too".
+            lines.append("\n<i>Not adding:</i>")
+            groups: dict[str, list[str]] = {}
+            prefix = proposal.get("prefix")
+            for r in skip:
+                title = r["title"].removeprefix(f"{prefix} - ") if prefix else r["title"]
+                groups.setdefault(r["reason"] or "skipped", []).append(f"{r['n']}. {title}")
+            for reason, names in groups.items():
+                lines.append(f"<i>• {escape(reason)}: {escape(', '.join(names))}</i>")
+        lines.append(
+            "\nReply to change it, e.g. <i>skip 2</i>, <i>add 9 too</i>, <i>make 3 at 4pm</i>."
+            if add else "\nReply e.g. <i>add 2</i> to include something anyway."
+        )
+        buttons = [(f"✅ Add {len(add)}", f"img:add:{token}")] if add else []
+        buttons.append(("❌ Cancel", f"img:no:{token}"))
+        return Reply("\n".join(lines), buttons=buttons)
+
+    async def proposal_button(self, chat_id: int, token: str, action: str) -> Reply:
+        async with self._lock(chat_id):
+            current = self.store.get_proposal(chat_id)
+            if not current or current[0] != token:
+                return Reply(EXPIRED_MSG)
+            if action == "add":
+                return await self._confirm(chat_id, current[1])
+            self.store.clear_proposal(chat_id)
+            return Reply("Okay, nothing added from that picture.")
+
+    async def _confirm(self, chat_id: int, proposal: dict) -> Reply:
+        self.store.clear_proposal(chat_id)
+        rows = [r for r in proposal["rows"] if r["include"]]
+        created: list[Event] = []
+        failed: list[str] = []
+        for r in rows:
+            ev, _ = self._event_from_draft(r)
+            try:
+                created.append(await self._cal(self.cal.create, ev))
+            except Exception:
+                log.exception("create failed")
+                failed.append(ev.title)
+        if not created:
+            return Reply("⚠️ I couldn't save those to the calendar. Please try again." if failed
+                         else "Nothing to add.")
+        self.store.set_last_event(chat_id, created[-1].id)
+        token = self.store.add_undo(chat_id, {"op": "delete_many", "event_ids": [e.id for e in created]})
+        lines = [f"✅ Added {len(created)} event{'s' if len(created) != 1 else ''}:"]
+        lines += [f"• <b>{escape(e.title)}</b> — {escape(fmt_short(e))}" for e in created]
+        if failed:
+            lines.append("⚠️ Couldn't save: " + ", ".join(escape(t) for t in failed))
+        return Reply("\n".join(lines), token)
+
+    async def _revise(self, chat_id: int, text: str, token: str, proposal: dict) -> list[Reply] | None:
+        """Apply a typed/spoken reply to the waiting picture list. None = not about the list."""
+        fields = ("n", "title", "date", "end_date", "start_time", "end_time", "location", "notes",
+                  "include", "reason")
+        listing = [{k: r.get(k) for k in fields} for r in proposal["rows"]]
+        context = "DATE REFERENCE:\n" + date_reference(self.now()) + "\n\nLIST:\n" + json.dumps(listing)
+        try:
+            result = await self.llm.complete(REVISE_PROMPT, f"{context}\n\nMESSAGE:\n{text}", max_tokens=8192)
+        except LLMBillingError:
+            return [Reply(CREDITS_MSG)]
+        except LLMError as e:
+            log.error("LLM failure on picture reply: %s", e)
+            return [Reply(LLM_DOWN_MSG)]
+        action = str(result.get("action") or "unrelated").lower()
+        log.info("picture reply: action=%s", action)
+        if action == "confirm":
+            return [await self._confirm(chat_id, proposal)]
+        if action == "cancel":
+            self.store.clear_proposal(chat_id)
+            return [Reply("Okay, nothing added from that picture.")]
+        if action != "revise":
+            return None
+
+        warnings = {r["n"]: r.get("warning") for r in proposal["rows"]}
+        rows = []
+        for it in result.get("items") or []:
+            if not isinstance(it, dict) or not _clean(it.get("title")) or not parse_date(it.get("date")):
+                continue
+            row = {k: _clean(it.get(k)) for k in fields if k not in ("n", "include")}
+            row["title"] = with_prefix(row["title"], proposal.get("prefix"))
+            row["include"] = bool(it.get("include"))
+            row["reason"] = None if row["include"] else (row["reason"] or "skipped")
+            row["warning"] = warnings.get(it.get("n"))
+            rows.append(row)
+        if not rows:
+            return [Reply("I didn't follow that change. Try e.g. <i>skip 2</i> or <i>add 5 too</i>, "
+                          "or tap ✅ / ❌ on the list.")]
+        proposal = {**proposal, "rows": number_rows(rows)}
+        return [self._proposal_reply(self.store.set_proposal(chat_id, proposal), proposal)]
+
+    # --------------------------------------------------------------- storage
+    def storage(self, docker_report: str | None = None) -> Reply:
+        st = self.store.stats()
+        lines = [
+            "<b>Storage</b>",
+            f"Bot database: {st['bytes'] / 1024:.0f} KB "
+            f"({st['undo']} undo, {st['proposal']} picture drafts, {st['llm_usage']} usage rows)",
+            "Voice notes, pictures and message text are never saved.",
+        ]
+        if docker_report:
+            lines.append(f"\n<b>Docker (last cleanup)</b>\n<pre>{escape(docker_report.strip()[:1500])}</pre>")
+        else:
+            lines.append("\n<i>No Docker report yet — it appears after scripts/cleanup.sh first runs.</i>")
+        return Reply("\n".join(lines))
 
     # ----------------------------------------------------------------- usage
     def usage(self) -> Reply:

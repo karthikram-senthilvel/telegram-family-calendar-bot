@@ -114,6 +114,11 @@ class FakeLLM:
         self.contexts.append(context)
         return self.responses.pop(0)
 
+    async def complete(self, system, text, attachment=None, max_tokens=4096):
+        self.contexts.append(text)
+        self.attachments = getattr(self, "attachments", []) + [attachment]
+        return self.responses.pop(0)
+
 
 def make(tmp_path, *responses):
     cal = FakeCalendar()
@@ -377,3 +382,162 @@ def test_typed_message_has_no_voice_note(tmp_path):
     a, _, llm = make(tmp_path, {"intent": "list"})
     run(a.handle(1, "what's coming up"))
     assert "speech-to-text" not in llm.contexts[0]
+
+
+# --------------------------------------------------------------- pictures
+from app.images import parse_sources, review_items, with_prefix  # noqa: E402
+
+NOV4 = datetime(2026, 11, 4, 9, tzinfo=TZ)  # a Wednesday
+
+DAYCARE_READ = {"source": "Little Acorns Academy", "period": "2026-11", "items": [
+    {"title": "Crazy Hat Day", "date": "2026-11-03", "weekday": "Tue", "category": "event"},
+    {"title": "Orange Friday", "date": "2026-11-06", "weekday": "Fri", "category": "event", "notes": "Wear orange"},
+    {"title": "Veterans Day", "date": "2026-11-11", "weekday": "Wed", "category": "public_holiday"},
+    {"title": "Happy Diwali!", "date": "2026-11-08", "weekday": "Sun", "category": "observance"},
+    {"title": "Theme: Wonders of the World", "date": "2026-11-15", "weekday": "Sun", "category": "theme"},
+    {"title": "Pre-K Picnic Songfest", "date": "2026-11-17", "weekday": "Tue", "start_time": "15:30",
+     "location": "Rooms 10-11", "notes": "Bring a blanket", "category": "event", "audience": "Pre-K"},
+    {"title": "ISD Schools Closed", "date": "2026-11-23", "end_date": "2026-11-25", "weekday": "Mon",
+     "category": "other_closure"},
+    {"title": "LAA Closed", "date": "2026-11-26", "end_date": "2026-11-27", "weekday": "Thu", "category": "closure"},
+    {"title": "Parent Teacher Conferences", "date": "2026-11-30", "weekday": "Mon", "category": "event",
+     "needs_check": "room says INSERT ROOM #1"},
+]}
+
+
+def make_pics(tmp_path, *responses):
+    cal, llm = FakeCalendar(), FakeLLM(*responses)
+    a = Assistant(llm, cal, Store(tmp_path / "s.db"), TZ, now=lambda: NOV4,
+                  image_sources=parse_sources("Little Acorns=LA"))
+    return a, cal, llm
+
+
+def test_prefix_helpers():
+    assert parse_sources("Little Acorns=LA; Lakeside Soccer=LS") == [
+        ("little acorns", "LA"), ("lakeside soccer", "LS")]
+    assert with_prefix("Crazy Hat Day", "LA") == "LA - Crazy Hat Day"
+    assert with_prefix("LA - Crazy Hat Day", "LA") == "LA - Crazy Hat Day"
+    assert with_prefix("LAA Closed", "LA") == "LA - Closed"  # the publisher's own abbreviation
+    assert with_prefix("LASER tag", "LA") == "LA - LASER tag"  # but not ordinary words
+    assert with_prefix("Tennis", None) == "Tennis"
+
+
+def test_review_items_rules():
+    rows = review_items(DAYCARE_READ["items"], NOV4.date(), "LA", {("la - orange friday", date(2026, 11, 6))})
+    by = {r["title"]: r for r in rows}
+    assert by["LA - Crazy Hat Day"]["reason"] == "already passed"
+    assert by["LA - Orange Friday"]["reason"] == "already on the calendar"
+    assert by["LA - Veterans Day"]["reason"] == "public holiday"
+    assert by["LA - Happy Diwali!"]["reason"] == "observance"
+    assert by["LA - ISD Schools Closed"]["reason"] == "not this place"
+    kept = [r["title"] for r in rows if r["include"]]
+    assert kept == ["LA - Pre-K Picnic Songfest", "LA - Closed", "LA - Parent Teacher Conferences"]
+    assert [r["n"] for r in rows if r["include"]] == [1, 2, 3]  # items to add are numbered first
+
+
+def test_review_items_flags_misread_weekday_and_other_class():
+    rows = review_items([
+        {"title": "Picture Day", "date": "2026-11-12", "weekday": "Wed", "category": "event"},  # Nov 12 is Thu
+        {"title": "Three's Picnic", "date": "2026-11-16", "category": "event", "audience": "3-year-olds",
+         "for_our_class": False},
+    ], NOV4.date(), None, set())
+    assert not rows[0]["include"] and "Thu" in rows[0]["reason"]
+    assert not rows[1]["include"] and rows[1]["reason"] == "for 3-year-olds"
+
+
+def test_picture_needs_confirmation_then_adds_with_one_undo(tmp_path):
+    a, cal, llm = make_pics(tmp_path, DAYCARE_READ)
+    [r] = run(a.handle_image(1, b"jpegbytes", "image/jpeg"))
+    assert not cal.events  # nothing added before confirming
+    assert llm.attachments == [(b"jpegbytes", "image/jpeg")]
+    assert "Little Acorns Academy — November 2026" in r.text
+    assert "<b>LA - Pre-K Picnic Songfest</b> · Rooms 10-11" in r.text and "3:30 PM" in r.text
+    assert "INSERT ROOM #1" in r.text and "• public holiday: 7. Veterans Day" in r.text
+    (add_label, add_data), (_, no_data) = r.buttons
+    assert add_label == "✅ Add 4" and add_data.startswith("img:add:")
+
+    token = add_data.split(":", 2)[2]
+    done = run(a.proposal_button(1, token, "add"))
+    titles = sorted(e.title for e in cal.events.values())
+    assert titles == ["LA - Closed", "LA - Orange Friday", "LA - Parent Teacher Conferences",
+                      "LA - Pre-K Picnic Songfest"]
+    closed = next(e for e in cal.events.values() if e.title == "LA - Closed")
+    assert closed.start == date(2026, 11, 26) and closed.end == date(2026, 11, 28)
+    assert "Added 4 events" in done.text and done.undo_token
+    assert "expired" in run(a.proposal_button(1, token, "add")).text  # can't add twice
+
+    assert "removed the 4 events" in run(a.undo(1, done.undo_token))
+    assert not cal.events
+
+
+def test_picture_reply_revises_then_confirms(tmp_path):
+    a, cal, llm = make_pics(tmp_path, DAYCARE_READ)
+    [first] = run(a.handle_image(1, b"img", "image/png", caption="daycare"))
+    assert "SENDER'S NOTE: daycare" in llm.contexts[0]
+    rows = a.store.get_proposal(1)[1]["rows"]
+    revised = [{**r, "include": r["include"] or r["title"] == "LA - ISD Schools Closed", "reason": None}
+               if r["title"] == "LA - ISD Schools Closed" else r for r in rows]
+    llm.responses += [{"action": "revise", "items": revised}, {"action": "confirm"}]
+    [second] = run(a.handle(1, "add the ISD closures too"))
+    assert "✅ Add 5" == second.buttons[0][0]
+    assert "img:add:" + first.buttons[0][1].split(":")[2] != second.buttons[0][1]  # old buttons expire
+    [done] = run(a.handle(1, "yes"))
+    assert "Added 5 events" in done.text and len(cal.events) == 5
+    assert a.store.get_proposal(1) is None
+
+
+def test_picture_unrelated_reply_and_cancel(tmp_path):
+    a, cal, _ = make_pics(tmp_path, DAYCARE_READ, {"action": "unrelated"},
+                          {"intent": "create", "events": [{"title": "Tennis", "date": "2026-11-07"}]})
+    run(a.handle_image(1, b"img", "image/jpeg"))
+    [r] = run(a.handle(1, "tennis saturday"))
+    assert "Added" in r.text and len(cal.events) == 1
+    assert a.store.get_proposal(1) is not None  # still waiting
+    assert "nothing added from that picture" in run(a.handle(1, "never mind"))[0].text
+    assert a.store.get_proposal(1) is None and len(cal.events) == 1
+
+
+def test_picture_rejects_unsupported_and_empty(tmp_path):
+    a, _, _ = make_pics(tmp_path, {"items": [], "reply": "This is a photo of a cat."})
+    assert "PDFs" in run(a.handle_image(1, b"x", "image/gif"))[0].text
+    assert "cat" in run(a.handle_image(1, b"x", "application/pdf"))[0].text
+
+
+def test_gemini_body_with_attachment():
+    from app.llm import GeminiLLM
+
+    body = GeminiLLM("k", ["gemini-x"])._body("sys", "txt", (b"abc", "application/pdf"), 8192)
+    part = body["contents"][0]["parts"][1]["inlineData"]
+    assert part == {"mimeType": "application/pdf", "data": "YWJj"}
+    assert body["generationConfig"]["maxOutputTokens"] == 8192
+
+
+# ------------------------------------------------------------- retention
+def test_cleanup_removes_expired_state(tmp_path):
+    import time as _time
+
+    store = Store(tmp_path / "s.db")
+    used = store.add_undo(1, {"op": "delete", "event_id": "a"})
+    store.take_undo(used)
+    keep = store.add_undo(1, {"op": "delete", "event_id": "b"})
+    store.add_usage("gemini-x", 1, 1)
+    store.set_proposal(1, {"rows": []})
+    old = _time.time() - 500 * 86400
+    with store._db:
+        store._db.execute("INSERT INTO llm_usage VALUES(?,?,?,?)", (old, "gemini-x", 1, 1))
+        store._db.execute("UPDATE proposal SET created=?", (old,))
+    removed = store.cleanup()
+    assert removed == {"undo": 1, "pending": 0, "proposal": 1, "llm_usage": 1}
+    assert store.take_undo(keep) is not None
+    st = store.stats()
+    assert st["llm_usage"] == 1 and st["proposal"] == 0 and st["bytes"] > 0
+
+
+def test_logs_never_contain_message_content(tmp_path, caplog):
+    import logging
+
+    a, _, _ = make(tmp_path, {"intent": "create", "events": [{"title": "Secret Surprise Party", "date": "2026-11-07"}]})
+    with caplog.at_level(logging.INFO):
+        run(a.handle(1, "secret surprise party saturday"))
+    assert "intent=create events=1" in caplog.text
+    assert "Surprise" not in caplog.text and "surprise" not in caplog.text

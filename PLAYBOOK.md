@@ -54,9 +54,11 @@ Copy these into a new project. Most need little or no change.
 
 | File | What it gives you | Reuse as-is? | What to change |
 |---|---|---|---|
-| `app/llm.py` | Gemini client and OpenRouter client behind one `interpret(context, message) -> dict`. Model fallback list, JSON parsing (`extract_json`), billing-error detection (`LLMBillingError`), token and cost tracking (`on_usage`, `PRICES_PER_M`) | ✅ client code | Replace `SYSTEM_PROMPT` with your task's prompt and schema |
+| `app/llm.py` | Gemini client and OpenRouter client behind one `interpret(context, message) -> dict`, plus a generic `complete(system, text, attachment)` that also sends an image or PDF. Model fallback list, JSON parsing (`extract_json`), billing-error detection (`LLMBillingError`), token and cost tracking (`on_usage`, `PRICES_PER_M`) | ✅ client code | Replace `SYSTEM_PROMPT` with your task's prompt and schema |
 | `app/config.py` | Env-var config with validation: required vars, allowed models (major labs only), provider switch | ✅ pattern | Add or remove fields |
-| `app/store.py` | Thread-safe SQLite store: per-chat pending state with expiry, undo tokens (one-time, 7-day expiry), LLM usage log | ✅ | Add tables as needed |
+| `app/store.py` | Thread-safe SQLite store: per-chat pending state with expiry, undo tokens (one-time, 7-day expiry), a "proposal awaiting confirmation" slot, LLM usage log, `cleanup()` + `stats()` | ✅ | Add tables as needed (and add them to `cleanup()`) |
+| `app/images.py` | Picture → events: extraction prompt with categories, a revise prompt for "skip 3 / add 5", and pure-Python rules (skip categories, prefix by source, past/duplicate/weekday checks) | 🔁 pattern | Categories and rules for your domain |
+| `scripts/cleanup.sh` + `install_cleanup_job.sh` | Monthly host-side Docker prune (dangling images, old build cache) via launchd, report shown in `/storage` | ✅ unchanged | Label name |
 | `app/main.py` | Telegram application skeleton: `allowed` user filter, command handlers, text and voice handlers, Undo button (`CallbackQueryHandler`), stranger logging, error handler, heartbeat task, startup notification, `set_my_commands` menu | ✅ skeleton | Swap the handlers for your commands |
 | `app/watchdog.py` | Standalone stdlib watchdog that alerts on Telegram when the heartbeat is stale and again on recovery | ✅ unchanged | Message text |
 | `app/healthcheck.py` | Docker healthcheck based on the heartbeat file age | ✅ unchanged | — |
@@ -99,7 +101,14 @@ Copy these into a new project. Most need little or no change.
 - **Per-chat `asyncio.Lock`**, so rapid messages in one chat don't interleave.
 - **Every change returns an undo token.** Store the inverse action (`delete` / `revert` to the
   old copy / `restore` the deleted copy). One-time use, 7-day expiry, checked against the chat.
-- **Reply objects** (`Reply(text_html, undo_token)`) keep the brain independent of Telegram, so the
+- **Confirm before bulk or uncertain writes.** Pictures produce a numbered proposal stored in SQLite
+  (24 h expiry, a token in the button data so old buttons can't fire). Buttons confirm or cancel;
+  a free-text or voice reply goes to a small "revise" prompt that returns the full updated list.
+  One Undo covers the whole batch (`delete_many`).
+- **Let the model classify, let code decide.** The picture prompt labels each item
+  (`public_holiday`, `theme`…); Python owns the skip list, the title prefix and the sanity checks
+  (e.g. the printed weekday must match the date), so wording changes in the prompt can't break the rules.
+- **Reply objects** (`Reply(text_html, undo_token, buttons)`) keep the brain independent of Telegram, so the
   same logic runs in Telegram, the CLI and tests.
 
 ### 4.3 Telegram
@@ -133,7 +142,17 @@ Copy these into a new project. Most need little or no change.
   plus a code guard that refuses `primary` and any ID that isn't `@group.calendar.google.com`.
 - **The Gemini *paid* tier doesn't train on prompts; the free tier may.** Enable billing.
 - **Keep audio local** (the `stt` container has no host port and no internet at runtime). Never log
-  transcripts or message text; log durations and counts.
+  transcripts, message text or model output; log durations, intents and counts (a test asserts this).
+
+### 4.6 Retention (don't let the Mac fill up)
+- **Don't store inputs at all:** audio, pictures and text live in memory only.
+- **Every table has an expiry** and the bot runs `store.cleanup()` at startup and every 24 h
+  (delete expired rows, `VACUUM`).
+- **Docker logs:** `json-file` with `max-size: 5m`, `max-file: 3` on every service.
+- **Docker itself is the real disk hog** (rebuilds leave GBs of layers and build cache): a monthly
+  launchd job runs `scripts/cleanup.sh` on the host. Never mount the Docker socket into a container
+  for this.
+- **`/storage`** shows the database size and the last cleanup report, so you can check from Telegram.
 
 ---
 
@@ -206,6 +225,9 @@ with the service account e-mail.
 | `docker compose run … python /clips/x.py` → `No module named 'app'` | Script outside `/srv` | `-e PYTHONPATH=/srv` |
 | `docker compose config` fails | `env_file: .env` missing | `cp .env.example .env` first |
 | OAuth "Make external → In production" blocked | Needs homepage and privacy URLs | Use a service account (§5.3) |
+| Picture read takes ~30 s; Telegram's "typing…" disappears after 5 s | Thinking model on a dense image | Send "📷 Reading the picture…" first, then the result |
+| Picture titles like "LA - LAA Closed" | Model leaves the publisher's own abbreviation in | `with_prefix()` strips a leading all-caps word starting with the prefix |
+| Watchdog kept running an old untagged image after a rebuild | Compose didn't recreate it | `docker compose up -d --build --force-recreate bot watchdog` |
 | Old local Ollama 7B looped asking pointless questions | Weak model plus free-form chat | Stronger hosted model + JSON schema + ask-once rule in code |
 
 ---
@@ -293,7 +315,9 @@ docker compose run --rm bot python -m app.cli --list-models
 .venv/bin/python -m pytest -q tests                # run tests
 docker stats --no-stream                           # memory per container
 ```
-In Telegram: `/help` · `/upcoming` · `/usage` · `/cancel` · ↩️ Undo on any change.
+In Telegram: `/help` · `/upcoming` · `/usage` · `/storage` · `/cancel` · ↩️ Undo on any change · 📷 send a picture.
+
+Cleanup: `scripts/cleanup.sh` (manual) · `scripts/install_cleanup_job.sh` (monthly launchd job).
 
 Key `.env` switches:
 
@@ -304,5 +328,7 @@ Key `.env` switches:
 | `STT_URL` | empty = voice off |
 | `ALLOWED_USER_IDS` | approved Telegram IDs |
 | `LOCAL_PLACES` | place names for fixing voice transcripts |
+| `IMAGE_SOURCES` | `Name=PREFIX; …` title prefix for pictures by publisher |
+| `CHILD_CLASS` | empty = keep every class's events from pictures |
 | `VOICE_MAX_SECONDS` | longest voice note accepted |
 | `NOTIFY_ON_START` | restart message on or off |

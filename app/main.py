@@ -21,6 +21,7 @@ from telegram.ext import (
 from .assistant import HELP_TEXT, Assistant, Reply
 from .calendars import make_backend
 from .config import Config
+from .images import MAX_IMAGE_BYTES, parse_sources
 from .llm import make_llm
 from .store import Store
 from .stt import STTClient
@@ -32,18 +33,21 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("family-event-bot")
 
 HEARTBEAT_INTERVAL = 60
+CLEANUP_INTERVAL = 24 * 3600
 
 
-def undo_markup(token: str | None) -> InlineKeyboardMarkup | None:
-    if not token:
-        return None
-    return InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Undo", callback_data=f"undo:{token}")]])
+def markup(r: Reply) -> InlineKeyboardMarkup | None:
+    if r.undo_token:
+        return InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Undo", callback_data=f"undo:{r.undo_token}")]])
+    if r.buttons:
+        return InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data=data) for label, data in r.buttons]])
+    return None
 
 
 async def send_replies(update: Update, replies: list[Reply]) -> None:
     for r in replies:
         await update.effective_message.reply_text(
-            r.text, parse_mode=ParseMode.HTML, reply_markup=undo_markup(r.undo_token),
+            r.text, parse_mode=ParseMode.HTML, reply_markup=markup(r),
             disable_web_page_preview=True,
         )
 
@@ -57,9 +61,12 @@ def build_app(cfg: Config) -> Application:
     assistant = Assistant(
         llm, calendar, store, cfg.tz, cfg.default_duration_minutes,
         stt=stt, voice_max_seconds=cfg.voice_max_seconds, local_places=cfg.local_places,
+        image_sources=parse_sources(cfg.image_sources), child_class=cfg.child_class,
     )
     heartbeat_file = cfg.data_dir / "heartbeat"
+    docker_report = cfg.data_dir / "docker-disk.txt"  # written by scripts/cleanup.sh on the host
     allowed = filters.User(user_id=list(cfg.allowed_user_ids))
+    admins = filters.User(user_id=list(cfg.admin_user_ids))
 
     async def on_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.effective_message.reply_text(HELP_TEXT, parse_mode=ParseMode.HTML)
@@ -85,6 +92,38 @@ def build_app(cfg: Config) -> Application:
             audio = bytes(await tg_file.download_as_bytearray())  # kept in memory only
             replies = await assistant.handle_voice(update.effective_chat.id, audio, media.duration or 0)
         await send_replies(update, replies)
+
+    async def on_image(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        msg = update.effective_message
+        await ctx.bot.send_chat_action(update.effective_chat.id, "typing")
+        if msg.photo:
+            media, mime, size = msg.photo[-1], "image/jpeg", msg.photo[-1].file_size  # largest size
+        else:
+            media, mime, size = msg.document, msg.document.mime_type or "", msg.document.file_size
+        if (size or 0) > MAX_IMAGE_BYTES:  # don't download what we won't read
+            await send_replies(update, [Reply("That file is too big for me (over 15 MB). "
+                                              "Try a screenshot of the calendar instead.")])
+            return
+        tg_file = await media.get_file()
+        data = bytes(await tg_file.download_as_bytearray())  # kept in memory only, never saved
+        await msg.reply_text("📷 Reading the picture — this takes about half a minute…")
+        await send_replies(update, await assistant.handle_image(
+            update.effective_chat.id, data, mime, msg.caption or ""))
+
+    async def on_proposal(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        q = update.callback_query
+        if q.from_user.id not in cfg.allowed_user_ids:
+            await q.answer()
+            return
+        _, action, token = (q.data or "::").split(":", 2)
+        await q.answer()
+        reply = await assistant.proposal_button(q.message.chat.id, token, action)
+        await q.edit_message_reply_markup(reply_markup=None)
+        await q.message.reply_text(reply.text, parse_mode=ParseMode.HTML, reply_markup=markup(reply))
+
+    async def on_storage(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        report = docker_report.read_text() if docker_report.exists() else None
+        await send_replies(update, [assistant.storage(report)])
 
     async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await ctx.bot.send_chat_action(update.effective_chat.id, "typing")
@@ -130,15 +169,26 @@ def build_app(cfg: Config) -> Application:
                     os._exit(1)
             await asyncio.sleep(HEARTBEAT_INTERVAL)
 
+    async def housekeeping() -> None:
+        while True:
+            try:
+                removed = await asyncio.to_thread(store.cleanup)
+                log.info("cleanup: removed %s", removed)
+            except Exception:
+                log.exception("cleanup failed")
+            await asyncio.sleep(CLEANUP_INTERVAL)
+
     async def post_init(app: Application) -> None:
         await asyncio.to_thread(calendar.check)
         await app.bot.set_my_commands([
             BotCommand("upcoming", "List the next events"),
             BotCommand("cancel", "Cancel the current conversation and start over"),
             BotCommand("usage", "Which AI model answered and estimated cost"),
+            BotCommand("storage", "What the bot keeps on disk (admins)"),
             BotCommand("help", "How to use the bot"),
         ])
         app.bot_data["heartbeat"] = asyncio.create_task(heartbeat(app))
+        app.bot_data["housekeeping"] = asyncio.create_task(housekeeping())
         me = await app.bot.get_me()
         log.info("Started as @%s using %s, models=%s", me.username, calendar.name, cfg.llm_models)
         if cfg.notify_on_start:
@@ -149,9 +199,10 @@ def build_app(cfg: Config) -> Application:
                     log.warning("could not notify %s: %s", uid, e)
 
     async def post_shutdown(app: Application) -> None:
-        task = app.bot_data.get("heartbeat")
-        if task:
-            task.cancel()
+        for name in ("heartbeat", "housekeeping"):
+            task = app.bot_data.get(name)
+            if task:
+                task.cancel()
         await llm.aclose()
         if stt:
             await stt.aclose()
@@ -169,8 +220,12 @@ def build_app(cfg: Config) -> Application:
     app.add_handler(CommandHandler("upcoming", on_upcoming, filters=allowed))
     app.add_handler(CommandHandler("usage", on_usage, filters=allowed))
     app.add_handler(MessageHandler(allowed & filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_handler(CommandHandler("storage", on_storage, filters=admins))
     app.add_handler(MessageHandler(allowed & (filters.VOICE | filters.AUDIO), on_voice))
+    app.add_handler(MessageHandler(
+        allowed & (filters.PHOTO | filters.Document.IMAGE | filters.Document.PDF), on_image))
     app.add_handler(CallbackQueryHandler(on_undo, pattern=r"^undo:"))
+    app.add_handler(CallbackQueryHandler(on_proposal, pattern=r"^img:"))
     app.add_handler(MessageHandler(~allowed, on_stranger))
     app.add_error_handler(on_error)
     return app

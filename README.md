@@ -9,6 +9,7 @@ Telegram ──► bot container ──► Gemini API (paid tier) · or OpenRout
                   └──► Google Calendar "Family Events"    (or Radicale/CalDAV, temporary)
 watchdog container ── alerts on Telegram if the bot stops responding
 stt container ────── voice notes → text, locally (NVIDIA Parakeet, no audio leaves the Mac)
+pictures / PDFs ──── read by Gemini, shown as a list, added only after you confirm
 ```
 
 ## What it does
@@ -23,6 +24,9 @@ stt container ────── voice notes → text, locally (NVIDIA Parakeet,
 | `delete the tennis event` | Deletes it, with Undo (restores it) |
 | `/upcoming` · `what's on this week?` | Lists the next events |
 | `/cancel`, `cancel`, `never mind`, `forget it`, `start over` | Clears any pending question and confirms |
+| 📷 photo or PDF of a school calendar / flyer | Lists the events it found and waits for **✅ Add** (see below) |
+| `/usage` | Model, tokens and estimated cost |
+| `/storage` (admins) | What the bot keeps on disk, and the last Docker cleanup |
 | `/help` | Short help |
 
 Rules:
@@ -57,6 +61,51 @@ Limits and settings:
 Resources:
 - RAM: about 1.4 GB idle and 2.2 GB peak on a 100-second note (capped at 3 GB).
 - Disk: the image is 3.3 GB.
+
+## Pictures (school calendars, flyers, PDFs)
+Send a photo, a screenshot or a PDF. Unlike text and voice, **nothing is added until you confirm**:
+
+1. Gemini reads the picture and lists every dated item with a category
+   (event, closure, someone else's closure, public holiday, observance, theme).
+2. Python decides what to propose:
+   - **skipped:** public holidays (Veterans Day…), greetings and awareness days (Happy Diwali,
+     National STEAM Day), weekly themes, other places' closures (ISD Schools Closed), dates that
+     already passed, events already on the calendar, and other classes' events if `CHILD_CLASS` is set
+   - **held back for a check:** a day number that doesn't match its weekday column (a likely misread)
+   - **prefixed:** titles get the publisher's prefix from `IMAGE_SOURCES`, e.g. `LA - Crazy Hat Day`
+3. The bot replies with a numbered list and **✅ Add N** / **❌ Cancel** buttons. Reply in words (typed or
+   voice) to adjust it: *"skip 3"*, *"add the ISD closures too"*, *"make 4 at 4pm"*, *"yes"*.
+4. **✅ Add** creates them all with **one Undo** for the batch. A list expires after 24 hours.
+
+Skipped items stay in the list under *Not adding* with their number and reason, so any of them
+(e.g. one that already passed) can still be added: *"add 10 too"*, then ✅.
+
+The picture is downloaded into memory, sent to Gemini (paid tier), and never saved. Reading a
+busy monthly calendar takes about 30 s and costs about 2–3 cents (see `/usage`).
+
+## Storage and cleanup
+Nothing you send is kept: voice notes, pictures and message text stay in memory only, and the logs
+record only the kind of request (e.g. `intent=create events=1`), never its content.
+
+| What | Where | Kept for |
+|---|---|---|
+| Pending question | `data/state.sqlite3` | 30 min |
+| Picture list awaiting ✅ | `data/state.sqlite3` | 24 h |
+| Undo snapshots (event details) | `data/state.sqlite3` | 7 days, or until used |
+| Usage (model + token counts only) | `data/state.sqlite3` | ~13 months |
+| Container logs | Docker | rotated, max 3 × 5 MB per container |
+
+- **Nightly:** the bot deletes expired rows and compacts the database (at startup, then every 24 h).
+- **Monthly:** `scripts/cleanup.sh` removes Docker's untagged image layers and build cache older than
+  7 days (rebuilds leave several GB behind). It never touches running containers, tagged images,
+  volumes or `data/`, and writes a report that `/storage` shows. Install the schedule once
+  (03:00 on the 1st of each month, via launchd):
+  ```sh
+  scripts/install_cleanup_job.sh                       # --uninstall to remove
+  launchctl kickstart gui/$(id -u)/com.family-event-bot.cleanup   # run it now
+  ```
+  It runs on the Mac, not in a container, because giving a container the Docker socket would give it
+  root on the host.
 
 ## Setup
 
@@ -157,9 +206,11 @@ docker compose run --rm bot python -m app.cli --live   # real LLM, real calendar
 - `app/dates.py` – relative dates, default times, formatting
 - `app/llm.py` – Gemini / OpenRouter clients and prompt
 - `app/calendars/` – Google and CalDAV backends
-- `app/store.py` – SQLite state (pending question, last event, undo log)
+- `app/images.py` – picture prompts and the rules for what gets proposed (categories, prefix, checks)
+- `app/store.py` – SQLite state (pending question, picture list, undo log, usage) and cleanup
 - `app/main.py` – Telegram handlers
 - `app/watchdog.py` – down alerts
 - `scripts/authorize_google.py` – one-time Google setup
+- `scripts/cleanup.sh`, `scripts/install_cleanup_job.sh` – monthly Docker cleanup
 
 Tests: `.venv/bin/python -m pytest -q tests`
